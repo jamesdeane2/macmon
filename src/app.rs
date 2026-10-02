@@ -10,7 +10,7 @@ use ratatui::crossterm::{
 use ratatui::{prelude::*, widgets::*};
 
 use crate::config::{Config, ViewType};
-use crate::metrics::{Metrics, Sampler, zero_div};
+use crate::metrics::{Metrics, NetMetrics, Sampler, zero_div};
 use crate::{metrics::MemMetrics, sources::SocInfo};
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
@@ -142,6 +142,68 @@ impl TempStore {
   }
 }
 
+#[derive(Debug, Default)]
+struct NetworkStore {
+  in_items: Vec<u64>,  // bytes/sec history for sparkline
+  out_items: Vec<u64>, // bytes/sec history for sparkline
+  prev_in: u64,        // previous cumulative bytes in
+  prev_out: u64,       // previous cumulative bytes out
+  in_rate: f64,        // current bytes/sec in
+  out_rate: f64,       // current bytes/sec out
+  max_rate: f64,       // peak rate for sparkline scaling
+  initialized: bool,   // first sample just sets prev, shows 0
+}
+
+impl NetworkStore {
+  fn push(&mut self, value: NetMetrics) {
+    if !self.initialized {
+      self.prev_in = value.bytes_in;
+      self.prev_out = value.bytes_out;
+      self.initialized = true;
+      return;
+    }
+
+    let delta_in = value.bytes_in.saturating_sub(self.prev_in);
+    let delta_out = value.bytes_out.saturating_sub(self.prev_out);
+
+    self.prev_in = value.bytes_in;
+    self.prev_out = value.bytes_out;
+
+    self.in_rate = avg2(self.in_rate, delta_in as f64);
+    self.out_rate = avg2(self.out_rate, delta_out as f64);
+
+    self.in_items.insert(0, delta_in);
+    self.in_items.truncate(MAX_SPARKLINE);
+
+    self.out_items.insert(0, delta_out);
+    self.out_items.truncate(MAX_SPARKLINE);
+
+    let local_max = self
+      .in_items
+      .iter()
+      .chain(self.out_items.iter())
+      .max()
+      .map_or(0, |v| *v) as f64;
+    self.max_rate = local_max;
+  }
+}
+
+fn format_rate(bytes_per_sec: f64) -> String {
+  const KB: f64 = 1024.0;
+  const MB: f64 = 1024.0 * 1024.0;
+  const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+  if bytes_per_sec >= GB {
+    format!("{:.1} GB/s", bytes_per_sec / GB)
+  } else if bytes_per_sec >= MB {
+    format!("{:.1} MB/s", bytes_per_sec / MB)
+  } else if bytes_per_sec >= KB {
+    format!("{:.1} KB/s", bytes_per_sec / KB)
+  } else {
+    format!("{:.0} B/s", bytes_per_sec)
+  }
+}
+
 // MARK: Components
 
 fn h_stack(area: Rect) -> (Rect, Rect) {
@@ -241,6 +303,8 @@ pub struct App {
   ecpu_freq: FreqStore,
   pcpu_freq: FreqStore,
   igpu_freq: FreqStore,
+
+  net: NetworkStore,
 }
 
 impl App {
@@ -248,6 +312,10 @@ impl App {
     let soc = SocInfo::new()?;
     let cfg = Config::load();
     Ok(Self { cfg, soc, ..Default::default() })
+  }
+
+  pub fn cfg_mut(&mut self) -> &mut Config {
+    &mut self.cfg
   }
 
   fn update_metrics(&mut self, data: Metrics) {
@@ -264,8 +332,10 @@ impl App {
     self.gpu_temp.push(data.temp.gpu_temp_avg);
 
     self.mem.push(data.memory);
+    self.net.push(data.network);
   }
 
+  // Individual metric boxes: full rounded border, labels on the top edge.
   fn title_block<'a>(&self, label_l: &str, label_r: &str) -> Block<'a> {
     let mut block = Block::new()
       .borders(Borders::ALL)
@@ -283,6 +353,33 @@ impl App {
     }
 
     block
+  }
+
+  // Section headers (machine specs, power summary) are a bare label line with no box
+  // around the children. Titles don't reserve space in ratatui, so carve off one row
+  // explicitly and return the remainder for the child blocks.
+  fn render_section_title(&self, f: &mut Frame, area: Rect, label_l: &str, label_r: &str) -> Rect {
+    if area.height == 0 {
+      return area;
+    }
+
+    let rows = Layout::default()
+      .direction(Direction::Vertical)
+      .constraints([Constraint::Length(1), Constraint::Fill(1)].as_ref())
+      .split(area);
+
+    let mut block = Block::new().borders(Borders::NONE).style(self.cfg.color);
+
+    if !label_l.is_empty() {
+      block = block.title_top(Line::from(format!(" {label_l} ")));
+    }
+
+    if !label_r.is_empty() {
+      block = block.title_top(Line::from(format!(" {label_r} ")).alignment(Alignment::Right));
+    }
+
+    f.render_widget(block, rows[0]);
+    rows[1]
   }
 
   fn get_power_block<'a>(&self, label: &str, val: &'a PowerStore, temp: f32) -> Sparkline<'a> {
@@ -364,71 +461,137 @@ impl App {
     }
   }
 
+  fn render_net_block(&self, f: &mut Frame, r: Rect, val: &NetworkStore) {
+    let (c1, c2) = h_stack(r);
+    let max = val.max_rate.max(1.0) as u64;
+
+    let label_in = format!("Net ▼ {}", format_rate(val.in_rate));
+    let w_in = Sparkline::default()
+      .block(self.title_block(label_in.as_str(), ""))
+      .direction(RenderDirection::RightToLeft)
+      .data(&val.in_items)
+      .max(max)
+      .style(self.cfg.color);
+    f.render_widget(w_in, c1);
+
+    let label_out = format!("Net ▲ {}", format_rate(val.out_rate));
+    let w_out = Sparkline::default()
+      .block(self.title_block(label_out.as_str(), ""))
+      .direction(RenderDirection::RightToLeft)
+      .data(&val.out_items)
+      .max(max)
+      .style(self.cfg.color);
+    f.render_widget(w_out, c2);
+  }
+
   fn render(&mut self, f: &mut Frame) {
-    let label_l = format!(
-      "{} ({}E+{}P+{}GPU {}GB)",
-      self.soc.chip_name,
-      self.soc.ecpu_cores,
-      self.soc.pcpu_cores,
-      self.soc.gpu_cores,
-      self.soc.memory_gb,
-    );
+    let show_top = self.cfg.show_cpu || self.cfg.show_gpu || self.cfg.show_mem;
+    let show_net = self.cfg.show_net;
+    let show_power = self.cfg.show_power;
+
+    // Build dynamic row constraints
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if show_top { constraints.push(Constraint::Fill(2)); }
+    if show_net { constraints.push(Constraint::Fill(1)); }
+    if show_power { constraints.push(Constraint::Fill(1)); }
+    if constraints.is_empty() { constraints.push(Constraint::Fill(1)); }
 
     let rows = Layout::default()
       .direction(Direction::Vertical)
-      .constraints([Constraint::Fill(2), Constraint::Fill(1)].as_ref())
+      .constraints(constraints)
       .split(f.area());
 
-    let brand = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let block = self.title_block(&label_l, &brand);
-    let iarea = block.inner(rows[0]);
-    f.render_widget(block, rows[0]);
+    let mut row_idx = 0;
 
-    let iarea = Layout::default()
-      .direction(Direction::Vertical)
-      .constraints([Constraint::Fill(1), Constraint::Fill(1)].as_ref())
-      .split(iarea);
+    // Top block: CPU/GPU/Mem
+    if show_top {
+      let iarea = if self.cfg.show_title {
+        let label_l = format!(
+          "{} ({}E+{}P+{}GPU {}GB)",
+          self.soc.chip_name,
+          self.soc.ecpu_cores,
+          self.soc.pcpu_cores,
+          self.soc.gpu_cores,
+          self.soc.memory_gb,
+        );
 
-    // 1st row
-    let (c1, c2) = h_stack(iarea[0]);
-    self.render_freq_block(f, c1, "E-CPU", &self.ecpu_freq);
-    self.render_freq_block(f, c2, "P-CPU", &self.pcpu_freq);
+        let brand = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        self.render_section_title(f, rows[row_idx], &label_l, &brand)
+      } else {
+        rows[row_idx]
+      };
 
-    // 2nd row
-    let (c1, c2) = h_stack(iarea[1]);
-    self.render_mem_block(f, c1, &self.mem);
-    self.render_freq_block(f, c2, "GPU", &self.igpu_freq);
+      // Determine sub-rows based on what's visible
+      let show_row1 = self.cfg.show_cpu;
+      let show_row2 = self.cfg.show_mem || self.cfg.show_gpu;
 
-    // 3rd row
-    let label_l = format!(
-      "Power: {:.2}W (avg {:.2}W, max {:.2}W)",
-      self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
-    );
+      let sub_constraints: Vec<Constraint> = [show_row1, show_row2]
+        .iter()
+        .filter(|&&v| v)
+        .map(|_| Constraint::Fill(1))
+        .collect();
 
-    // Show label only if sensor is available
-    let label_r = if self.sys_power.top_value > 0.0 {
-      format!(
-        "Total {:.2}W ({:.2}, {:.2})",
-        self.sys_power.top_value, self.sys_power.avg_value, self.sys_power.max_value
-      )
-    } else {
-      "".to_string()
-    };
+      let sub_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(sub_constraints)
+        .split(iarea);
 
-    let block = self.title_block(&label_l, &label_r);
-    let usage = format!(" 'q' – quit, 'c' – color, 'v' – view | -/+ {}ms ", self.cfg.interval);
-    let block = block.title_bottom(Line::from(usage).right_aligned());
-    let iarea = block.inner(rows[1]);
-    f.render_widget(block, rows[1]);
+      let mut sub_idx = 0;
 
-    let ha = Layout::default()
-      .direction(Direction::Horizontal)
-      .constraints([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)].as_ref())
-      .split(iarea);
+      if show_row1 {
+        let (c1, c2) = h_stack(sub_rows[sub_idx]);
+        self.render_freq_block(f, c1, "E-CPU", &self.ecpu_freq);
+        self.render_freq_block(f, c2, "P-CPU", &self.pcpu_freq);
+        sub_idx += 1;
+      }
 
-    f.render_widget(self.get_power_block("CPU", &self.cpu_power, self.cpu_temp.last()), ha[0]);
-    f.render_widget(self.get_power_block("GPU", &self.gpu_power, self.gpu_temp.last()), ha[1]);
-    f.render_widget(self.get_power_block("ANE", &self.ane_power, 0.0), ha[2]);
+      if show_row2 {
+        let (c1, c2) = h_stack(sub_rows[sub_idx]);
+        if self.cfg.show_mem {
+          self.render_mem_block(f, c1, &self.mem);
+        }
+        if self.cfg.show_gpu {
+          let area = if self.cfg.show_mem { c2 } else { sub_rows[sub_idx] };
+          self.render_freq_block(f, area, "GPU", &self.igpu_freq);
+        }
+      }
+
+      row_idx += 1;
+    }
+
+    // Network row
+    if show_net {
+      self.render_net_block(f, rows[row_idx], &self.net);
+      row_idx += 1;
+    }
+
+    // Power row
+    if show_power {
+      let label_l = format!(
+        "Power: {:.2}W (avg {:.2}W, max {:.2}W)",
+        self.all_power.top_value, self.all_power.avg_value, self.all_power.max_value,
+      );
+
+      let label_r = if self.sys_power.top_value > 0.0 {
+        format!(
+          "Total {:.2}W ({:.2}, {:.2})",
+          self.sys_power.top_value, self.sys_power.avg_value, self.sys_power.max_value
+        )
+      } else {
+        "".to_string()
+      };
+
+      let iarea = self.render_section_title(f, rows[row_idx], &label_l, &label_r);
+
+      let ha = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)].as_ref())
+        .split(iarea);
+
+      f.render_widget(self.get_power_block("CPU", &self.cpu_power, self.cpu_temp.last()), ha[0]);
+      f.render_widget(self.get_power_block("GPU", &self.gpu_power, self.gpu_temp.last()), ha[1]);
+      f.render_widget(self.get_power_block("ANE", &self.ane_power, 0.0), ha[2]);
+    }
   }
 
   pub fn run_loop(&mut self, interval: Option<u32>) -> WithError<()> {

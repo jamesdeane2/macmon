@@ -367,6 +367,44 @@ pub fn libc_swap() -> WithError<(u64, u64)> {
   Ok((usage, total))
 }
 
+// MARK: Network
+
+pub fn libc_net_bytes() -> WithError<(u64, u64)> {
+  let mut bytes_in: u64 = 0;
+  let mut bytes_out: u64 = 0;
+
+  unsafe {
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if libc::getifaddrs(&mut addrs) != 0 {
+      return Err("Failed to get network interfaces".into());
+    }
+
+    let mut cursor = addrs;
+    while !cursor.is_null() {
+      let ifa = &*cursor;
+
+      // Only look at AF_LINK (data link layer) entries which have interface stats
+      if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family == libc::AF_LINK as u8 {
+        // Skip loopback
+        let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+        if name != "lo0" {
+          if !ifa.ifa_data.is_null() {
+            let data = &*(ifa.ifa_data as *const libc::if_data);
+            bytes_in += data.ifi_ibytes as u64;
+            bytes_out += data.ifi_obytes as u64;
+          }
+        }
+      }
+
+      cursor = ifa.ifa_next;
+    }
+
+    libc::freeifaddrs(addrs);
+  }
+
+  Ok((bytes_in, bytes_out))
+}
+
 // MARK: SockInfo
 
 #[derive(Debug, Default, Clone, Serialize)]

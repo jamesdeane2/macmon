@@ -2,7 +2,8 @@ use core_foundation::dictionary::CFDictionaryRef;
 use serde::Serialize;
 
 use crate::sources::{
-  IOHIDSensors, IOReport, SMC, SocInfo, cfio_get_residencies, cfio_watts, libc_ram, libc_swap,
+  IOHIDSensors, IOReport, SMC, SocInfo, cfio_get_residencies, cfio_watts, libc_net_bytes, libc_ram,
+  libc_swap,
 };
 
 type WithError<T> = Result<T, Box<dyn std::error::Error>>;
@@ -28,9 +29,16 @@ pub struct MemMetrics {
 }
 
 #[derive(Debug, Default, Serialize)]
+pub struct NetMetrics {
+  pub bytes_in: u64,  // total bytes received (cumulative)
+  pub bytes_out: u64, // total bytes sent (cumulative)
+}
+
+#[derive(Debug, Default, Serialize)]
 pub struct Metrics {
   pub temp: TempMetrics,
   pub memory: MemMetrics,
+  pub network: NetMetrics,
   pub ecpu_usage: (u32, f32), // freq, percent_from_max
   pub pcpu_usage: (u32, f32), // freq, percent_from_max
   pub gpu_usage: (u32, f32),  // freq, percent_from_max
@@ -216,6 +224,11 @@ impl Sampler {
     Ok(MemMetrics { ram_total, ram_usage, swap_total, swap_usage })
   }
 
+  fn get_net(&mut self) -> WithError<NetMetrics> {
+    let (bytes_in, bytes_out) = libc_net_bytes()?;
+    Ok(NetMetrics { bytes_in, bytes_out })
+  }
+
   fn get_sys_power(&mut self) -> WithError<f32> {
     let val = self.smc.read_val("PSTR")?;
     let val = f32::from_le_bytes(val.data.clone().try_into().unwrap());
@@ -288,6 +301,7 @@ impl Sampler {
 
     rs.memory = self.get_mem()?;
     rs.temp = self.get_temp()?;
+    rs.network = self.get_net()?;
 
     rs.sys_power = match self.get_sys_power() {
       Ok(val) => val.max(rs.all_power),

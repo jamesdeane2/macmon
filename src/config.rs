@@ -22,6 +22,24 @@ pub struct Config {
 
   #[serde_inline_default(1000)]
   pub interval: u32,
+
+  #[serde_inline_default(true)]
+  pub show_cpu: bool,
+
+  #[serde_inline_default(true)]
+  pub show_gpu: bool,
+
+  #[serde_inline_default(true)]
+  pub show_mem: bool,
+
+  #[serde_inline_default(true)]
+  pub show_net: bool,
+
+  #[serde_inline_default(true)]
+  pub show_power: bool,
+
+  #[serde_inline_default(true)]
+  pub show_title: bool,
 }
 
 impl Default for Config {

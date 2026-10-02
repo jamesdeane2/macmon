@@ -27,10 +27,17 @@ enum Commands {
   Debug,
 }
 
+const INTERACTIVE_KEYS: &str = "\
+Interactive keys:
+  q, Ctrl-C  quit
+  c          cycle through colors
+  v          toggle view (sparkline / gauge)
+  -, +       decrease / increase the update interval by 250ms";
+
 /// Sudoless performance monitoring CLI tool for Apple Silicon processors
 /// https://github.com/vladkens/macmon
 #[derive(Debug, Parser)]
-#[command(version, verbatim_doc_comment)]
+#[command(version, verbatim_doc_comment, after_help = INTERACTIVE_KEYS)]
 struct Cli {
   #[command(subcommand)]
   command: Option<Commands>,
@@ -38,6 +45,30 @@ struct Cli {
   /// Update interval in milliseconds
   #[arg(short, long, global = true, default_value_t = 1000)]
   interval: u32,
+
+  /// Hide CPU graphs
+  #[arg(long, default_value_t = false)]
+  no_cpu: bool,
+
+  /// Hide GPU graph
+  #[arg(long, default_value_t = false)]
+  no_gpu: bool,
+
+  /// Hide memory graph
+  #[arg(long, default_value_t = false)]
+  no_mem: bool,
+
+  /// Hide network graphs
+  #[arg(long, default_value_t = false)]
+  no_net: bool,
+
+  /// Hide power graphs
+  #[arg(long, default_value_t = false)]
+  no_power: bool,
+
+  /// Hide the top title line with the machine specs
+  #[arg(long, default_value_t = false)]
+  no_title: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -77,6 +108,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(ValueSource::CommandLine) => Some(args.interval),
         _ => None,
       };
+
+      // CLI flags override config (--no-X hides, absence preserves config)
+      if args.no_cpu { app.cfg_mut().show_cpu = false; }
+      if args.no_gpu { app.cfg_mut().show_gpu = false; }
+      if args.no_mem { app.cfg_mut().show_mem = false; }
+      if args.no_net { app.cfg_mut().show_net = false; }
+      if args.no_power { app.cfg_mut().show_power = false; }
+      if args.no_title { app.cfg_mut().show_title = false; }
 
       app.run_loop(msec)?;
     }
